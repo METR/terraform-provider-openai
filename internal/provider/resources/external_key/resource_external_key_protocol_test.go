@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,6 +46,8 @@ type externalKeyServerState struct {
 	malformedType      bool
 	malformedPurpose   bool
 	malformedCreatedAt bool
+	overrideResponseID bool
+	responseID         string
 	projectIDs         []string
 	unexpected         string
 }
@@ -148,9 +151,13 @@ func (s *externalKeyServerState) writeExternalKey(w http.ResponseWriter) {
 	if s.malformedCreatedAt {
 		createdAt = "not-a-timestamp"
 	}
+	responseID := externalKeyTestID
+	if s.overrideResponseID {
+		responseID = s.responseID
+	}
 	response := map[string]any{
 		"object":          "organization.external_key",
-		"id":              externalKeyTestID,
+		"id":              responseID,
 		"name":            s.name,
 		"api_project_ids": projectIDs,
 		"workspace_id":    "",
@@ -179,6 +186,10 @@ func externalKeyProviderFactories() map[string]func() (tfprotov6.ProviderServer,
 }
 
 func externalKeyConfig(baseURL string) string {
+	return externalKeyConfigWithName(baseURL, "terraform-ekm")
+}
+
+func externalKeyConfigWithName(baseURL string, name string) string {
 	return fmt.Sprintf(`
 provider "openai" {
   admin_api_key = %q
@@ -186,7 +197,7 @@ provider "openai" {
 }
 
 resource "openai_external_key" "test" {
-  name        = "terraform-ekm"
+  name        = %q
   kms_arn     = %q
   role_arn    = %q
   external_id = %q
@@ -195,7 +206,7 @@ resource "openai_external_key" "test" {
     create_before_destroy = true
   }
 }
-`, externalKeyTestAdminKey, baseURL+"/v1", externalKeyTestKMSARN, externalKeyTestRoleARN, externalKeyTestExternalID)
+`, externalKeyTestAdminKey, baseURL+"/v1", name, externalKeyTestKMSARN, externalKeyTestRoleARN, externalKeyTestExternalID)
 }
 
 func TestExternalKeyProtocolLifecycleAndImport(t *testing.T) {
@@ -232,6 +243,113 @@ func TestExternalKeyProtocolLifecycleAndImport(t *testing.T) {
 	}
 	if state.creates != 1 || state.reads == 0 || state.deletes != 1 || state.exists {
 		t.Fatalf("unexpected lifecycle: create=%d read=%d delete=%d exists=%t", state.creates, state.reads, state.deletes, state.exists)
+	}
+}
+
+func TestExternalKeyProtocolCreateBeforeDestroyReplacementUsesFreshID(t *testing.T) {
+	const replacementID = "extkey_0000000000000000000000000001"
+	var mu sync.Mutex
+	registrations := map[string]string{}
+	createdIDs := []string{}
+	deletedIDs := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if req.Header.Get("Authorization") != "Bearer "+externalKeyTestAdminKey {
+			writeExternalKeyError(w, http.StatusUnauthorized, "missing synthetic admin authorization")
+			return
+		}
+		collectionPath := "/v1/organization/external_keys"
+		writeResponse := func(id string, name string) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object":          "organization.external_key",
+				"id":              id,
+				"name":            name,
+				"type":            "aws",
+				"purpose":         "ekm",
+				"api_project_ids": []string{},
+				"workspace_id":    "",
+				"created_at":      1791523799,
+				"kms_arn":         externalKeyTestKMSARN,
+				"role_arn":        externalKeyTestRoleARN,
+				"external_id":     externalKeyTestExternalID,
+			})
+		}
+		switch {
+		case req.Method == http.MethodPost && req.URL.Path == collectionPath:
+			var body map[string]any
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				writeExternalKeyError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+			ids := []string{externalKeyTestID, replacementID}
+			if len(createdIDs) >= len(ids) {
+				writeExternalKeyError(w, http.StatusConflict, "unexpected extra registration")
+				return
+			}
+			id := ids[len(createdIDs)]
+			name, _ := body["name"].(string)
+			createdIDs = append(createdIDs, id)
+			registrations[id] = name
+			writeResponse(id, name)
+		case strings.HasPrefix(req.URL.Path, collectionPath+"/"):
+			id := strings.TrimPrefix(req.URL.Path, collectionPath+"/")
+			name, exists := registrations[id]
+			if !exists {
+				writeExternalKeyError(w, http.StatusNotFound, "The external key "+id+" was not found")
+				return
+			}
+			if req.Method == http.MethodGet {
+				writeResponse(id, name)
+				return
+			}
+			if req.Method == http.MethodDelete {
+				writeResponse(id, name)
+				delete(registrations, id)
+				deletedIDs = append(deletedIDs, id)
+				return
+			}
+			writeExternalKeyError(w, http.StatusMethodNotAllowed, "unexpected API method")
+		default:
+			writeExternalKeyError(w, http.StatusNotFound, "unsupported endpoint")
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: externalKeyProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: externalKeyConfigWithName(server.URL, "terraform-ekm"),
+				Check: resource.TestCheckResourceAttr(
+					"openai_external_key.test", "external_key_id", externalKeyTestID,
+				),
+			},
+			{
+				Config: externalKeyConfigWithName(server.URL, "terraform-ekm-rotated"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"openai_external_key.test", "external_key_id", replacementID,
+					),
+					resource.TestCheckResourceAttr(
+						"openai_external_key.test", "name", "terraform-ekm-rotated",
+					),
+				),
+			},
+		},
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(createdIDs) != fmt.Sprint([]string{externalKeyTestID, replacementID}) {
+		t.Fatalf("unexpected replacement creates: %v", createdIDs)
+	}
+	if fmt.Sprint(deletedIDs) != fmt.Sprint([]string{externalKeyTestID, replacementID}) {
+		t.Fatalf("unexpected replacement deletes: %v", deletedIDs)
+	}
+	if len(registrations) != 0 {
+		t.Fatalf("replacement cleanup left registrations: %v", registrations)
 	}
 }
 
@@ -382,6 +500,7 @@ func TestExternalKeyNotFoundDoesNotConfuseDisabledFeatureWithDeletion(t *testing
 					}
 					w.Header().Set("Content-Type", "application/json")
 					_ = json.NewEncoder(w).Encode(map[string]any{
+						"id":      externalKeyTestID,
 						"type":    "aws",
 						"purpose": "ekm",
 					})
@@ -411,6 +530,7 @@ func TestExternalKeyDeleteAssociationFailurePreservesState(t *testing.T) {
 		if req.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":      externalKeyTestID,
 				"type":    "aws",
 				"purpose": "ekm",
 			})
@@ -556,6 +676,55 @@ func TestExternalKeyCreateRetainsStateAfterPostIDMappingFailure(t *testing.T) {
 	assertExternalKeyCreateFailureCanDelete(t, managed, serverState, response.State)
 }
 
+func TestExternalKeyRejectsInvalidCreateResponseIdentifiers(t *testing.T) {
+	for _, id := range []string{"", " ", ".", ".."} {
+		t.Run(fmt.Sprintf("%q", id), func(t *testing.T) {
+			server, serverState := newExternalKeyServer(t)
+			serverState.mu.Lock()
+			serverState.overrideResponseID = true
+			serverState.responseID = id
+			serverState.mu.Unlock()
+			managed, _ := externalKeyResourceAndState(t, server.URL)
+			var schema frameworkresource.SchemaResponse
+			managed.Schema(context.Background(), frameworkresource.SchemaRequest{}, &schema)
+			response := &frameworkresource.CreateResponse{State: tfsdk.State{Schema: schema.Schema}}
+			managed.Create(context.Background(), frameworkresource.CreateRequest{Plan: externalKeyPlan(t, schema)}, response)
+			if !response.Diagnostics.HasError() {
+				t.Fatal("invalid create response identity was accepted")
+			}
+		})
+	}
+}
+
+func TestExternalKeyReadRejectsMismatchedResponseIdentity(t *testing.T) {
+	server, serverState := newExternalKeyServer(t)
+	serverState.mu.Lock()
+	serverState.exists = true
+	serverState.name = "terraform-ekm"
+	serverState.overrideResponseID = true
+	serverState.responseID = "extkey_0000000000000000000000000099"
+	serverState.mu.Unlock()
+	managed, state := externalKeyResourceAndState(t, server.URL)
+	response := &frameworkresource.ReadResponse{State: state}
+	managed.Read(context.Background(), frameworkresource.ReadRequest{State: state}, response)
+	if !response.Diagnostics.HasError() || response.State.Raw.IsNull() {
+		t.Fatalf("mismatched read identity was accepted: null state=%t diagnostics=%v", response.State.Raw.IsNull(), response.Diagnostics)
+	}
+	var data externalKeyTestModel
+	if diagnostics := response.State.Get(context.Background(), &data); diagnostics.HasError() {
+		t.Fatalf("read preserved state: %v", diagnostics)
+	}
+	if data.ExternalKeyID.ValueString() != externalKeyTestID {
+		t.Fatalf("mismatched read changed state identity to %q", data.ExternalKeyID.ValueString())
+	}
+	serverState.mu.Lock()
+	serverState.overrideResponseID = false
+	serverState.reads = 0
+	serverState.deletes = 0
+	serverState.mu.Unlock()
+	assertExternalKeyCreateFailureCanDelete(t, managed, serverState, response.State)
+}
+
 func TestExternalKeyDeleteRejectsMismatchedStateDiscriminator(t *testing.T) {
 	server, serverState := newExternalKeyServer(t)
 	managed, state := externalKeyResourceAndState(t, server.URL)
@@ -594,6 +763,34 @@ func TestExternalKeyDeleteRejectsMismatchedRemoteDiscriminator(t *testing.T) {
 	serverState.mu.Unlock()
 	if !response.Diagnostics.HasError() || response.State.Raw.IsNull() || reads != 1 || deletes != 0 {
 		t.Fatalf("mismatched remote discriminator reached delete: reads=%d deletes=%d null state=%t diagnostics=%v", reads, deletes, response.State.Raw.IsNull(), response.Diagnostics)
+	}
+}
+
+func TestExternalKeyDeleteRejectsMismatchedRemoteIdentity(t *testing.T) {
+	server, serverState := newExternalKeyServer(t)
+	managed, state := externalKeyResourceAndState(t, server.URL)
+	serverState.mu.Lock()
+	serverState.exists = true
+	serverState.name = "terraform-ekm"
+	serverState.overrideResponseID = true
+	serverState.responseID = "extkey_0000000000000000000000000099"
+	serverState.mu.Unlock()
+
+	response := &frameworkresource.DeleteResponse{State: state}
+	managed.Delete(context.Background(), frameworkresource.DeleteRequest{State: state}, response)
+	serverState.mu.Lock()
+	reads := serverState.reads
+	deletes := serverState.deletes
+	serverState.mu.Unlock()
+	if !response.Diagnostics.HasError() || response.State.Raw.IsNull() || reads != 1 || deletes != 0 {
+		t.Fatalf("mismatched remote identity reached delete: reads=%d deletes=%d null state=%t diagnostics=%v", reads, deletes, response.State.Raw.IsNull(), response.Diagnostics)
+	}
+	var data externalKeyTestModel
+	if diagnostics := response.State.Get(context.Background(), &data); diagnostics.HasError() {
+		t.Fatalf("delete preserved state: %v", diagnostics)
+	}
+	if data.ExternalKeyID.ValueString() != externalKeyTestID {
+		t.Fatalf("mismatched delete changed state identity to %q", data.ExternalKeyID.ValueString())
 	}
 }
 

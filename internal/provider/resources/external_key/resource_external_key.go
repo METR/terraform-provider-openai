@@ -223,6 +223,10 @@ func (r *ExternalKeyResource) Create(ctx context.Context, req resource.CreateReq
 		resp.Diagnostics.AddError("Invalid OpenAI API response", err.Error())
 		return
 	}
+	if err := openaiapi.ValidatePathParameter("external_key_id", data.ExternalKeyID.ValueString()); err != nil {
+		resp.Diagnostics.AddError("Invalid OpenAI API response", err.Error())
+		return
+	}
 	if data.ExternalKeyID.IsUnknown() {
 		data.ExternalKeyID = types.StringNull()
 	}
@@ -334,8 +338,13 @@ func (r *ExternalKeyResource) Read(ctx context.Context, req resource.ReadRequest
 		resp.Diagnostics.AddError("OpenAI API request failed", err.Error())
 		return
 	}
+	requestedResourceID := data.ExternalKeyID
 	if err := openaiapi.ApplyStringResponseField(responseData, []string{"id"}, &data.ExternalKeyID, true); err != nil {
 		resp.Diagnostics.AddError("Invalid OpenAI API response", err.Error())
+		return
+	}
+	if data.ExternalKeyID.ValueString() != requestedResourceID.ValueString() {
+		resp.Diagnostics.AddError("Invalid OpenAI API response", fmt.Sprintf("Expected external_key_id to match the requested resource identity %q, got %q.", requestedResourceID.ValueString(), data.ExternalKeyID.ValueString()))
 		return
 	}
 	if err := openaiapi.ApplyStringResponseField(responseData, []string{"name"}, &data.Name, false); err != nil {
@@ -437,6 +446,14 @@ func (r *ExternalKeyResource) Delete(ctx context.Context, req resource.DeleteReq
 			return
 		}
 		remoteData := data
+		if err := openaiapi.ApplyStringResponseField(responseData, []string{"id"}, &remoteData.ExternalKeyID, true); err != nil {
+			resp.Diagnostics.AddError("Invalid OpenAI API response", err.Error())
+			return
+		}
+		if remoteData.ExternalKeyID.ValueString() != data.ExternalKeyID.ValueString() {
+			resp.Diagnostics.AddError("Refusing to delete incompatible resource", fmt.Sprintf("Expected external_key_id to match the requested resource identity %q, got %q.", data.ExternalKeyID.ValueString(), remoteData.ExternalKeyID.ValueString()))
+			return
+		}
 		if err := openaiapi.ApplyStringResponseField(responseData, []string{"purpose"}, &remoteData.Purpose, true); err != nil {
 			resp.Diagnostics.AddError("Invalid OpenAI API response", err.Error())
 			return
