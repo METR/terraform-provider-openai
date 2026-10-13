@@ -15,6 +15,7 @@ import (
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	openaiapi "github.com/openai/terraform-provider-openai/internal/provider/openaiapi"
+	resourceapikey "github.com/openai/terraform-provider-openai/internal/provider/resources/api_key"
 	resourcecertificate "github.com/openai/terraform-provider-openai/internal/provider/resources/certificate"
 	resourcegroup "github.com/openai/terraform-provider-openai/internal/provider/resources/group"
 	resourcegrouprole "github.com/openai/terraform-provider-openai/internal/provider/resources/group_role"
@@ -266,6 +267,8 @@ func (p *OpenAIProvider) DataSources(ctx context.Context) []func() datasource.Da
 		resourceprojectratelimit.NewProjectRateLimitsDataSource,
 		resourceprojectuser.NewProjectUserDataSource,
 		resourceproject.NewProjectsDataSource,
+		resourceapikey.NewAdminAPIKeysDataSource,
+		resourceapikey.NewProjectAPIKeysDataSource,
 		resourceprojectuser.NewProjectUsersDataSource,
 		resourceprojectuserrole.NewProjectUserRoleDataSource,
 		resourceprojectuserrole.NewProjectUserRolesDataSource,
